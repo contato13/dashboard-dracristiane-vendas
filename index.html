@@ -771,7 +771,8 @@ function headerScore(cells) {
 }
 
 /* ---------- grade -> linhas ---------- */
-const AVISOS = { cidades: new Set(), criativos: new Set(), trocas: 0, datas: 0 };
+const AVISOS = { cidades: new Set(), criativos: new Set(), trocas: 0, datas: 0,
+                 semValor: new Set(), colunaValor: '', faltaColuna: new Set() };
 
 /* qual coluna realmente contém datas — o cabeçalho às vezes mente */
 function taxaDeData(grid, hi, col) {
@@ -821,6 +822,35 @@ function consertarDatas(linhas, anoAba) {
   return linhas;
 }
 
+/* A coluna de valor só é preenchida quando houve venda — é isso que a
+   distingue de telefone ou número do lead, que vêm preenchidos sempre.    */
+function acharColunaValor(grid, hi, colSd, evitar) {
+  let largura = 0;
+  for (let i = hi; i < Math.min(grid.length, hi + 400); i++) largura = Math.max(largura, (grid[i] || []).length);
+  const dinheiro = x => {
+    const s = String(x ?? '').trim();
+    if (!s) return false;
+    if (s.replace(/\D/g, '').length > 8) return false;      // telefone, CPF e afins
+    const n = toNum(s);
+    return n >= 100 && n <= 200000;
+  };
+  let melhor = -1, melhorNota = 0;
+  for (let c = 0; c < largura; c++) {
+    if (evitar.has(c)) continue;
+    let comVenda = 0, okVenda = 0, semVenda = 0, okSemVenda = 0;
+    for (let i = hi + 1; i < grid.length; i++) {
+      const row = grid[i] || [];
+      if (!row.some(x => String(x ?? '').trim() !== '')) continue;
+      if (toDate(row[colSd])) { comVenda++; if (dinheiro(row[c])) okVenda++; }
+      else { semVenda++; if (dinheiro(row[c])) okSemVenda++; }
+    }
+    if (comVenda < 3) continue;
+    const nota = okVenda / comVenda - (semVenda ? okSemVenda / semVenda : 0);
+    if (nota > melhorNota) { melhorNota = nota; melhor = c; }
+  }
+  return melhorNota >= 0.6 ? melhor : -1;
+}
+
 function gridToRows(grid, nomeAba) {
   if (!grid || !grid.length) return [];
   let hi = 0, best = -1;
@@ -837,6 +867,33 @@ function gridToRows(grid, nomeAba) {
     if (c < 0) return [];
     map.d = c;
   }
+  // a coluna de valor não traz dinheiro nenhum nas linhas de venda? procura a certa
+  if (map.sd !== undefined) {
+    let vendas = 0, comValor = 0;
+    for (let i = hi + 1; i < grid.length; i++) {
+      const row = grid[i] || [];
+      if (!toDate(row[map.sd])) continue;
+      vendas++;
+      if (map.v !== undefined && toNum(row[map.v]) > 0) comValor++;
+    }
+    if (vendas >= 3 && comValor / vendas < 0.3) {
+      const evitar = new Set([map.d, map.sd, map.c, map.cr, map.k, map.a, map.n].filter(x => x !== undefined));
+      const c = acharColunaValor(grid, hi, map.sd, evitar);
+      if (c >= 0 && c !== map.v) {
+        const titulo = String((grid[hi] || [])[c] ?? '').trim();
+        AVISOS.colunaValor = titulo || `coluna ${c + 1}`;
+        map.v = c;
+      }
+    }
+  }
+
+  // coluna renomeada pela equipe vira zero silencioso no painel: avisa em vez de calar
+  const ESPERADAS = { c: 'cidade', cr: 'observação / origem', a: 'agendou consulta',
+                      k: 'quem atendeu', n: 'no-show', sd: 'data da venda', v: 'valor pago' };
+  Object.keys(ESPERADAS).forEach(k => {
+    if (map[k] === undefined) AVISOS.faltaColuna.add(ESPERADAS[k] + (nomeAba ? ` (${nomeAba})` : ''));
+  });
+
   // ano da aba, para consertar dígito errado ("2023" no meio de 2026)
   const ma = String(nomeAba || '').match(/(20\d{2})/);
   const anoAba = ma ? +ma[1] : 0;
@@ -859,6 +916,10 @@ function gridToRows(grid, nomeAba) {
     // alguém digitou o valor na coluna da data e a data na coluna do valor
     if (!sd && toNum(brutoSd) > 100 && toDate(brutoV)) {
       sd = toDate(brutoV); v = toNum(brutoSd); AVISOS.trocas++;
+    }
+    if (sd && !v && AVISOS.semValor.size < 4) {
+      const cru = String(brutoV ?? '').trim();
+      AVISOS.semValor.add(cru === '' ? '(célula vazia)' : '"' + cru.slice(0, 18) + '"');
     }
     out.push({
       d, c, p: '', cr,
@@ -1135,6 +1196,14 @@ function aplicar(rows, origem, aviso) {
   if (AVISOS.criativos.size) extras.push(`${AVISOS.criativos.size} origem(ns) sem grupo: ${[...AVISOS.criativos].slice(0, 4).join(', ')}`);
   if (AVISOS.trocas) extras.push(`${AVISOS.trocas} linha(s) com data da venda e valor trocados de coluna — corrigi na leitura`);
   if (AVISOS.datas) extras.push(`${AVISOS.datas} data(s) de entrada digitada(s) fora do período da aba — corrigi pelo contexto`);
+  const vendasTudo = rows.filter(r => r.sd).length;
+  const comValor = rows.filter(r => r.sd && r.v > 0).length;
+  if (AVISOS.faltaColuna.size)
+    extras.unshift(`Não achei a coluna de ${[...AVISOS.faltaColuna].join(', ')}. O painel está tratando como vazia — confira se alguém renomeou o título.`);
+  if (AVISOS.colunaValor)
+    extras.unshift(`A coluna de valor do cabeçalho estava vazia nas vendas; os valores estavam em "${AVISOS.colunaValor}" e é de lá que estou lendo`);
+  if (vendasTudo && comValor < vendasTudo)
+    extras.unshift(`${vendasTudo - comValor} de ${vendasTudo} vendas da planilha inteira estão sem valor. O que vem na célula: ${[...AVISOS.semValor].join(', ')}`);
   if (TENTATIVAS.abas.length) extras.push('Abas lidas: ' + TENTATIVAS.abas.join(', '));
 
   status(msg, extras.length ? 'aviso' : 'ok', extras.join(' · '));
@@ -1160,6 +1229,7 @@ async function atualizar(silencioso) {
   carregando = true;
   if (!silencioso) status('Lendo a planilha…', 'load');
   AVISOS.cidades.clear(); AVISOS.criativos.clear(); AVISOS.trocas = 0; AVISOS.datas = 0;
+  AVISOS.semValor.clear(); AVISOS.colunaValor = ''; AVISOS.faltaColuna.clear();
   zerarTentativas();
   try {
     const r = await puxarRemoto();
