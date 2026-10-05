@@ -198,10 +198,6 @@ footer{margin-top:52px;padding-top:18px;border-top:1px solid var(--rule);
   <div class="ctrl-in">
     <div class="fld"><label for="de">Início</label><input type="date" id="de"></div>
     <div class="fld"><label for="ate">Fim</label><input type="date" id="ate"></div>
-    <div class="fld">
-      <label>Atalhos</label>
-      <div class="presets" id="presets"></div>
-    </div>
     <div class="rangeinfo" id="rangeinfo"></div>
   </div>
 
@@ -220,15 +216,12 @@ footer{margin-top:52px;padding-top:18px;border-top:1px solid var(--rule);
 </div>
 
   <div class="srcpanel" id="srcpanel" hidden>
-    <p>Cole o <b>link do webhook</b> (n8n, Make) ou o <b>link de uma Planilha Google</b> compartilhada
-    como "qualquer pessoa com o link → Leitor". As abas só importam no caso da planilha.</p>
+    <p>Cole o link da Planilha Google. Ela precisa estar em <b>Compartilhar → Acesso geral →
+    "Qualquer pessoa com o link" → Leitor</b>, senão o painel bate numa tela de login.
+    Um endereço de webhook (n8n, Make) também serve.</p>
     <div class="fld">
-      <label for="sheetIn">Endereço da fonte</label>
-      <input type="text" id="sheetIn" placeholder="https://…/webhook/…  ou  https://docs.google.com/spreadsheets/d/…">
-    </div>
-    <div class="fld">
-      <label for="abasIn">Abas</label>
-      <input type="text" id="abasIn" placeholder="Junho 2026, Julho 2026, Agosto 2026">
+      <label for="sheetIn">Link da planilha</label>
+      <input type="text" id="sheetIn" placeholder="https://docs.google.com/spreadsheets/d/…">
     </div>
     <button id="btnConectar" type="button">Conectar</button>
   </div>
@@ -389,7 +382,10 @@ function render(){
   $('app').style.display = coorte.length ? 'block' : 'none';
 
   const nd = days(de, ate) + 1;
-  $('rangeinfo').innerHTML = `<b>${br(de)} a ${br(ate)}</b><br>${nd} dia${nd>1?'s':''} · ${coorte.length} leads na coorte`;
+  // quando o período cruza o ano, dd/mm sozinho fica ambíguo
+  const mesmoAno = de.slice(0,4) === ate.slice(0,4);
+  const rot = d => mesmoAno ? br(d) : br(d) + '/' + d.slice(2,4);
+  $('rangeinfo').innerHTML = `<b>${rot(de)} a ${rot(ate)}</b><br>${nd} dia${nd>1?'s':''} · ${coorte.length} leads na coorte`;
   document.querySelectorAll('#presets button').forEach(b =>
     b.setAttribute('aria-pressed', b.dataset.de === de && b.dataset.ate === ate));
   if(!coorte.length) return;
@@ -611,7 +607,7 @@ const CONFIG = {
   // Endereço que devolve a planilha pronta: webhook do n8n, Make, ou
   // qualquer URL que sirva .xlsx, CSV ou JSON. Tem prioridade sobre o resto.
   ARQUIVO_URL: '',
-  SHEET_ID: 'https://docs.google.com/spreadsheets/d/1fLBMbE_mhHheQolfeIroA4wRVqMJk09d/edit',
+  SHEET_ID: '',          // cole o link pelo painel: ele fica guardado na URL
   ABAS: ['Junho 2026', 'Julho 2026'],
   CSV_URLS: [],
   AUTO_MIN: 10
@@ -948,15 +944,28 @@ function temFonte() {
 
 const semCache = u => u + (u.includes('?') ? '&' : '?') + '_=' + Date.now();
 
+/* O motivo da falha é o que importa para o usuário. Cada tentativa anota aqui. */
+const TENTATIVAS = { negado: false, naoAchou: false, login: false, bloqueado: false, abas: [] };
+function zerarTentativas() {
+  TENTATIVAS.negado = TENTATIVAS.naoAchou = TENTATIVAS.login = TENTATIVAS.bloqueado = false;
+  TENTATIVAS.abas = [];
+}
+function anotar(r, erro) {
+  if (erro) { TENTATIVAS.bloqueado = true; return; }
+  if (r.status === 401 || r.status === 403) TENTATIVAS.negado = true;
+  else if (r.status === 404) TENTATIVAS.naoAchou = true;
+}
+
 async function buscarTexto(urls) {
   for (const u of urls) {
     try {
       const r = await fetch(semCache(u));
-      if (!r.ok) continue;
+      if (!r.ok) { anotar(r); continue; }
       const t = await r.text();
-      if (/^\s*</.test(t)) continue;          // veio HTML = página de erro, não dado
+      // página HTML no lugar dos dados = tela de login, ou seja, planilha fechada
+      if (/^\s*</.test(t)) { TENTATIVAS.login = true; continue; }
       if (t.trim()) return t;
-    } catch (e) { /* tenta a próxima */ }
+    } catch (e) { anotar(null, e); }
   }
   return null;
 }
@@ -998,16 +1007,20 @@ async function tentarPastaInteira(id) {
   for (const u of urlsPasta(id)) {
     try {
       const r = await fetch(semCache(u));
-      if (!r.ok) continue;
+      if (!r.ok) { anotar(r); continue; }
       const buf = await r.arrayBuffer();
       if (buf.byteLength < 2000) continue;
+      const b = new Uint8Array(buf);
+      if (!(b[0] === 0x50 && b[1] === 0x4B)) { TENTATIVAS.login = true; continue; }  // não é zip
       await carregarXLSX();
-      const wb = XLSX.read(new Uint8Array(buf), { type: 'array', cellDates: false });
+      const wb = XLSX.read(b, { type: 'array', cellDates: false });
       const linhas = [];
-      wb.SheetNames.forEach(n => linhas.push(
-        ...gridToRows(XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: '' }), n)));
+      wb.SheetNames.forEach(n => {
+        const l = gridToRows(XLSX.utils.sheet_to_json(wb.Sheets[n], { header: 1, raw: true, defval: '' }), n);
+        if (l.length) { linhas.push(...l); TENTATIVAS.abas.push(n); }
+      });
       if (linhas.length) return linhas;
-    } catch (e) { /* tenta a próxima */ }
+    } catch (e) { anotar(null, e); }
   }
   return null;
 }
@@ -1045,18 +1058,24 @@ async function puxarRemoto() {
         if (!obrigatoria && (!achouAlguma || vaziosSeguidos >= 3)) continue;
         const t = await buscarTexto(urlsCSV(id, aba));
         const l = t ? gridToRows(parseCSV(t), aba) : [];
-        if (l.length) { todas.push(...l); achouAlguma = true; vaziosSeguidos = 0; }
+        if (l.length) { todas.push(...l); achouAlguma = true; vaziosSeguidos = 0; TENTATIVAS.abas.push(aba); }
         else {
           if (!obrigatoria) vaziosSeguidos++;
           else faltando.push(aba + (t ? ' (sem linhas legíveis)' : ''));
         }
       }
     }
+    // nenhuma aba nomeada respondeu: tenta a primeira aba, seja ela qual for
+    if (!todas.length) {
+      const t = await buscarTexto(urlsCSV(id, ''));
+      if (t) todas.push(...gridToRows(parseCSV(t), ''));
+    }
   }
 
   if (!todas.length) {
     const e = new Error('sem dados');
     e.arquivoDrive = !!id && id.length < 40;   // id curto = .xlsx cru no Drive
+    e.faltando = faltando;
     throw e;
   }
   return { rows: todas, aviso: faltando.length ? 'Não li: ' + faltando.join(', ') : '', fonte: 'Google Sheets' };
@@ -1092,15 +1111,13 @@ function aplicar(rows, origem, aviso) {
     const x = r.sd && r.sd > r.d ? r.sd : r.d;
     return x > m ? x : m;
   }, rows[0].d);
-  const hoje = isoOf(new Date());
-  CUT = (MAX_D > hoje && hoje > MIN_D) ? hoje : MAX_D;
-  const atraso = days(MAX_D, hoje);
+  // o período é o que está na planilha, inteiro: datas futuras entram igual
+  CUT = MAX_D;
+  const atraso = days(MAX_D, isoOf(new Date()));
   AVISO_ATRASO = atraso > 3
-    ? `ATENÇÃO: a entrada mais recente é de ${br(MAX_D)}, ${atraso} dias atrás. Ou a planilha parou de ser alimentada, ou a leitura está presa numa cópia antiga.`
+    ? `A entrada mais recente é de ${br(MAX_D)}, ${atraso} dias atrás. Ou a planilha parou de ser alimentada, ou a leitura está presa numa cópia antiga.`
     : '';
-  $('de').min = $('ate').min = MIN_D;
-  $('de').max = $('ate').max = MAX_D;
-  montarAtalhos();
+  ['de', 'ate'].forEach(id => { $(id).removeAttribute('min'); $(id).removeAttribute('max'); });
   const vendas = rows.filter(r => r.sd).length;
   $('srcmeta').innerHTML =
     `Fonte <b>${origem}</b><br>Registros <b>${rows.length.toLocaleString('pt-BR')} leads</b> · ` +
@@ -1109,13 +1126,16 @@ function aplicar(rows, origem, aviso) {
     `${rows.length.toLocaleString('pt-BR')} leads · ${vendas} venda${vendas !== 1 ? 's' : ''} · ` +
     `corte ${CUT.slice(8, 10)}/${CUT.slice(5, 7)}/${CUT.slice(0, 4)}`;
   const hora = new Date().toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
-  let msg = `${origem} · ${rows.length.toLocaleString('pt-BR')} leads · lido às ${hora}`;
+  const nAbas = TENTATIVAS.abas.length;
+  const abasTxt = nAbas ? `${nAbas} aba${nAbas > 1 ? 's' : ''} · ` : '';
+  let msg = `${origem} · ${abasTxt}${rows.length.toLocaleString('pt-BR')} leads · lido às ${hora}`;
   const extras = [];
   if (aviso) extras.push(aviso);
   if (AVISOS.cidades.size) extras.push(`${AVISOS.cidades.size} cidade(s) fora do mapa: ${[...AVISOS.cidades].slice(0, 4).join(', ')}`);
   if (AVISOS.criativos.size) extras.push(`${AVISOS.criativos.size} origem(ns) sem grupo: ${[...AVISOS.criativos].slice(0, 4).join(', ')}`);
   if (AVISOS.trocas) extras.push(`${AVISOS.trocas} linha(s) com data da venda e valor trocados de coluna — corrigi na leitura`);
   if (AVISOS.datas) extras.push(`${AVISOS.datas} data(s) de entrada digitada(s) fora do período da aba — corrigi pelo contexto`);
+  if (TENTATIVAS.abas.length) extras.push('Abas lidas: ' + TENTATIVAS.abas.join(', '));
 
   status(msg, extras.length ? 'aviso' : 'ok', extras.join(' · '));
   setRange(MIN_D, CUT);
@@ -1132,24 +1152,6 @@ function status(txt, tipo, detalhe) {
 }
 const statusErro = m => status(m, 'erro');
 
-function montarAtalhos() {
-  const MES = ['Janeiro', 'Fevereiro', 'Março', 'Abril', 'Maio', 'Junho', 'Julho',
-               'Agosto', 'Setembro', 'Outubro', 'Novembro', 'Dezembro'];
-  const meses = [...new Set(ROWS.map(r => r.d.slice(0, 7)))].sort().slice(-7);
-  const b = [['Tudo', MIN_D, CUT]];
-  meses.forEach(m => {
-    if (m + '-01' > CUT) return;
-    const [y, mo] = m.split('-');
-    const fim = isoOf(new Date(+y, +mo, 0));
-    b.push([MES[+mo - 1], m + '-01', fim > CUT ? CUT : fim]);
-  });
-  if (days(MIN_D, CUT) >= 30) b.push(['Últimos 30 dias', shiftD(CUT, -29), CUT]);
-  if (days(MIN_D, CUT) >= 15) b.push(['Últimos 15 dias', shiftD(CUT, -14), CUT]);
-  $('presets').innerHTML = b.map(([l, x, y]) => `<button data-de="${x}" data-ate="${y}">${l}</button>`).join('');
-  $('presets').querySelectorAll('button').forEach(btn =>
-    btn.addEventListener('click', () => setRange(btn.dataset.de, btn.dataset.ate)));
-}
-
 /* ---------- ciclo de atualização ---------- */
 let carregando = false;
 async function atualizar(silencioso) {
@@ -1158,20 +1160,38 @@ async function atualizar(silencioso) {
   carregando = true;
   if (!silencioso) status('Lendo a planilha…', 'load');
   AVISOS.cidades.clear(); AVISOS.criativos.clear(); AVISOS.trocas = 0; AVISOS.datas = 0;
+  zerarTentativas();
   try {
     const r = await puxarRemoto();
     aplicar(r.rows, r.fonte || 'Google Sheets', r.aviso);
   } catch (e) {
     const jaTem = ROWS && ROWS.length ? 'Mostrando os dados embutidos. ' : '';
-    if (CONFIG.ARQUIVO_URL && e && !e.arquivoDrive) {
-      statusErro(jaTem + 'O endereço configurado não respondeu como esperado (' + e.message +
-        '). Confira se o fluxo do n8n está ativo e se você usou a URL de produção, não a de teste.');
-      return;
-    }
-    statusErro(jaTem + (e && e.arquivoDrive
-      ? 'O link aponta para um arquivo .xlsx guardado no Drive, e o Google não entrega esse formato por leitura direta. A saída sem mexer na planilha do time é criar uma planilha-espelho que se copia sozinha uma vez por dia — veja o arquivo sincronizar.gs. Enquanto isso, use "Carregar planilha".'
-      : 'Não consegui ler a planilha ao vivo agora. Duas causas prováveis: o compartilhamento saiu de "Qualquer pessoa com o link", ou este arquivo foi aberto por duplo clique (endereço file://), o que faz o navegador bloquear a leitura — nesse caso publique o painel num endereço http(s). Para ver os dados de hoje sem isso, use "Carregar planilha".'));
+    statusErro(jaTem + diagnostico(e));
   } finally { carregando = false; }
+}
+
+/* Uma causa por vez, da mais provável para a menos. */
+function diagnostico(e) {
+  if (e && e.arquivoDrive)
+    return 'Esse link aponta para um .xlsx guardado no Drive, não para uma Planilha Google. Abra o arquivo e use Arquivo → Salvar como Planilhas Google; o link que sair daí funciona aqui.';
+
+  // o mais comum de longe: a planilha continua privada
+  if (TENTATIVAS.negado || TENTATIVAS.login)
+    return 'A planilha está fechada para quem não tem login. Abra ela, clique em Compartilhar, e em "Acesso geral" troque para "Qualquer pessoa com o link" como Leitor. Depois clique em Atualizar agora.';
+
+  if (TENTATIVAS.naoAchou && !TENTATIVAS.bloqueado)
+    return 'O Google não encontrou essa planilha. Confira se o link foi colado inteiro e se o arquivo não foi movido para a lixeira.';
+
+  if (TENTATIVAS.bloqueado && location.protocol === 'file:')
+    return 'O painel está aberto como arquivo do computador (endereço file://), e nesse modo o navegador bloqueia leitura externa. Publique o index.html num endereço http(s) — o Netlify Drop resolve arrastando o arquivo — ou use "Carregar planilha".';
+
+  if (TENTATIVAS.bloqueado)
+    return 'O navegador bloqueou a conexão com o Google antes de chegar resposta. Costuma ser rede, VPN, bloqueador de anúncios ou extensão de privacidade. Teste numa aba anônima.';
+
+  if (CONFIG.ARQUIVO_URL)
+    return `O endereço não respondeu como esperado (${e && e.message}). Confira se o fluxo está ativo e se você usou a URL de produção, não a de teste.`;
+
+  return 'Cheguei na planilha, mas não achei nenhuma linha com data de entrada. Confira se a primeira linha da aba tem os títulos das colunas.';
 }
 
 /* ---------- ligações da barra de fonte ---------- */
@@ -1189,6 +1209,9 @@ function ligarFonte() {
     const p = $('srcpanel'); p.hidden = !p.hidden;
     if (!p.hidden) $('sheetIn').focus();
   });
+  ['sheetIn'].forEach(id => $(id).addEventListener('keydown', ev => {
+    if (ev.key === 'Enter') { ev.preventDefault(); $('btnConectar').click(); }
+  }));
   $('btnConectar').addEventListener('click', () => {
     const bruto = $('sheetIn').value.trim();
     const id = sheetId(bruto);
@@ -1196,9 +1219,7 @@ function ligarFonte() {
     CONFIG.ARQUIVO_URL = ''; CONFIG.SHEET_ID = '';
     if (id) {
       CONFIG.SHEET_ID = id;
-      CONFIG.ABAS = $('abasIn').value.split(',').map(s => s.trim()).filter(Boolean);
       q.set('sheet', id);
-      if (CONFIG.ABAS.length) q.set('abas', CONFIG.ABAS.join(','));
     } else if (/^https?:\/\//i.test(bruto)) {
       CONFIG.ARQUIVO_URL = bruto;
       q.set('fonte', bruto);
@@ -1227,7 +1248,6 @@ function iniciar() {
   }
   $('sheetIn').value = CONFIG.ARQUIVO_URL ||
     (sheetId(CONFIG.SHEET_ID) ? 'https://docs.google.com/spreadsheets/d/' + sheetId(CONFIG.SHEET_ID) : '');
-  $('abasIn').value = (CONFIG.ABAS || []).join(', ');
   aplicar(FALLBACK_ROWS.slice(), 'planilha de 20/08/2026', '');
   if (temFonte()) atualizar(false);
   else status('planilha de 20/08/2026 · dados embutidos. Conecte o Google Sheets ou carregue a planilha para atualizar sozinho.', 'aviso');
